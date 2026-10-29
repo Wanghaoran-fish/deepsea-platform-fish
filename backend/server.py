@@ -535,6 +535,60 @@ def fish_series(minutes=60, cage_id=None):
     return out
 
 
+def fish_growth_curve(cage_id=None):
+    """生长趋势长轴曲线：放养日 → 计划起捕日，按天一个点，让折线图呈现长期生长趋势。
+
+    与 fish_series 区别：fish_series 是 5 秒一点的高频监测（默认 60 分钟窗口，曲线全是抖动）；
+    本接口按天出点，直接用 planned_weight 的计划曲线，尾部附上当前实测体重点。
+    配置缺失（无放养日期/目标规格）时返回 points=[]，前端显示空态，不编曲线。
+    """
+    cage = FARM.cage(cage_id or "cage_01") or {}
+    st = cage.get("stocking") or {}
+    try:
+        t0 = datetime.strptime(st["date"], "%Y-%m-%d").timestamp() * 1000
+        t1 = datetime.strptime(st["plan_harvest"], "%Y-%m-%d").timestamp() * 1000
+        w0 = float(st["init_size_g"])
+        w1 = float(st["target_size_g"])
+    except (KeyError, ValueError, TypeError):
+        return {"points": [], "current": None, "cage_id": cage_id or "cage_01",
+                "species": cage.get("species", ""),
+                "note": "放养台账不完整，无法绘制长期生长曲线"}
+    if t1 <= t0:
+        return {"points": [], "current": None, "cage_id": cage_id or "cage_01",
+                "species": cage.get("species", ""), "note": "放养/起捕日期顺序有误"}
+    now = int(time.time() * 1000) // 1000 * 1000
+    day = 24 * 3600 * 1000
+    end = min(t1, now + day)
+    n = max(2, int((end - t0) / day) + 1)
+    n = min(n, 400)  # 安全上限，防止配置异常导致几千点
+    points = []
+    for i in range(n):
+        ts = t0 + i * day
+        points.append({"ts": ts, "planned_weight_g": round(planned_weight(cage, ts) or w0, 1)})
+    # 当前实测点：取最近 5 秒的高频序列最后一条；离线则给 None（不编）
+    sim = fish_sim_state()
+    offline = sim["gen_status"] == "stopped" or sim["sim_mode"] == "camera_off"
+    current = None
+    if not offline:
+        live = fish_series(5, cage.get("cage_id") or cage_id)
+        if live:
+            last = live[-1]
+            current = {
+                "ts": last["ts"],
+                "observed_weight_g": last.get("avg_weight_g"),
+                "fish_count": last.get("fish_count"),
+                "total_biomass_kg": last.get("total_biomass_kg"),
+            }
+    return {
+        "points": points,
+        "current": current,
+        "cage_id": cage.get("cage_id") or cage_id or "cage_01",
+        "species": cage.get("species", ""),
+        "stocking": {"date": st.get("date", ""), "plan_harvest": st.get("plan_harvest", ""),
+                     "init_size_g": w0, "target_size_g": w1},
+    }
+
+
 def heat_grid():
     """10×10 鱼群密度网格（拍板问题单 问题 5 建议 A）。
 
@@ -563,11 +617,17 @@ def heat_grid():
     return g
 
 
-def fish_positions_3d():
+def fish_positions_3d(cage_id=None):
     """三维鱼群位置（点云）：给三维热力图用。
 
-    返回单位为米的网箱内坐标（X/Y 10m × 10m，水深 Z 8m），每条鱼一个点，
+    返回单位为米的网箱内坐标（X/Y 10m × 10m，水深 Z 8m；Z=0 水面、Z=8 箱底）。
     点的状态 s：0=正常（冷色）、1=摄食活跃（暖色）、2=异常（红）。
+
+    🔴 2026-10-29 王浩然：分布形态按**当前网箱鱼种**差异化（文献依据见 docs/验收）：
+      · 大黄鱼（1号箱）：集群、中下层 —— 点收成一个紧凑的球，居中偏下；
+      · 黑鲷（2号箱）：底层、不集群 —— 点贴近箱底、水平方向散开。
+      （大黄鱼：吴常文等《几种深水网箱养殖鱼类行为习性的观察》水产学报；
+        黑鲷：同文表4「分布于下、底层网箱边缘、较少集群」。）
     与仿真场景联动：聚集→中心收紧成球；密度骤降→点数减少、分散；
     摄食异常→大多静止、偶有红点；生成器停止/摄像头离线→返回 None（不编数据）。
     """
@@ -577,6 +637,8 @@ def fish_positions_3d():
         return None
     r = _rng()
     DIMS = {"x": 10.0, "y": 10.0, "z": 8.0}
+    cage = FARM.cage(cage_id or "cage_01") or {}
+    sp = cage.get("species") or "大黄鱼"
     n_points = 1000
     if mode == "density_drop":
         n_points = 650
@@ -589,26 +651,29 @@ def fish_positions_3d():
             z = min(7.9, max(0.1, cz + r.gauss(0, 1.2)))
             s = 1 if r.random() < 0.2 else 0
             pts.append({"x": round(x, 2), "y": round(y, 2), "z": round(z, 2), "s": s})
-        return {"dims": DIMS, "points": pts, "mode": mode, "gen_status": gen}
+        return {"dims": DIMS, "points": pts, "mode": mode, "gen_status": gen, "species": sp}
 
-    # ---- 正常 / 密度骤降 / 摄食异常 的分布 ----
-    # 🔴 2026-10-15 队长修：这一段原来被错插到 fish_cameras() 的 return 之后，
-    #    成了**死代码** —— 结果是 fish_positions_3d() 在**默认（正常）场景下返回 None**，
-    #    三维热力图打开是一片空白，只有切到「鱼群聚集」造故障才有数据。
-    #    语法合法、页面能开、验收 9/9 也过 —— 光看代码或跑验收都发现不了，
-    #    是把函数**实际调了一遍**才抓到的。
+    # ---- 正常 / 密度骤降 / 摄食异常 的分布：按鱼种选形态 ----
+    if sp == "大黄鱼":
+        # 集群·中下层：紧凑球，中心 (5,5,4.8)，横径~1.8m、竖径~1.6m
+        cx, cy, cz, sx, sy, sz = 5.0, 5.0, 4.8, 0.9, 0.9, 0.8
+    elif sp in ("黑鲷", "许氏平鲉", "牙鲆", "大菱鲆", "半滑舌鳎", "黄盖鲽", "圆斑星鲽", "星突江鲽"):
+        # 底层贴礁·分散：贴近箱底（Z≈7.2），水平大散开
+        cx, cy, cz, sx, sy, sz = 5.0, 5.0, 7.2, 3.1, 3.1, 0.45
+    else:
+        # 其他鱼种：默认中层散布
+        cx, cy, cz, sx, sy, sz = 4.5, 5.2, 4.0, 2.2, 2.2, 1.6
     for _ in range(n_points):
-        # 正常分布：围绕中心 (4.5, 5.2)，鱼群集中在中上层（Z 约 2.5~5.5）
-        x = min(9.9, max(0.1, 4.5 + r.gauss(0, 2.2)))
-        y = min(9.9, max(0.1, 5.2 + r.gauss(0, 2.2)))
-        z = min(7.9, max(0.1, 4.0 + r.gauss(0, 1.6)))
+        x = min(9.9, max(0.1, cx + r.gauss(0, sx)))
+        y = min(9.9, max(0.1, cy + r.gauss(0, sy)))
+        z = min(7.9, max(0.1, cz + r.gauss(0, sz)))
         if mode == "feeding_abnormal":
             # 多数静止（状态0），偶发个别异常红点
             s = 2 if r.random() < 0.04 else 0
         else:
             s = 1 if r.random() < 0.18 else 0
         pts.append({"x": round(x, 2), "y": round(y, 2), "z": round(z, 2), "s": s})
-    return {"dims": DIMS, "points": pts, "mode": mode, "gen_status": gen}
+    return {"dims": DIMS, "points": pts, "mode": mode, "gen_status": gen, "species": sp}
 
 
 def fish_cameras():
@@ -1421,13 +1486,16 @@ class Handler(BaseHTTPRequestHandler):
             # 🔴 2026-10-18：接 cage_id，首页 KPI 跟着当前网箱切
             return self._json(fish_series(minutes, cage_id=(one("cage_id", "") or None)))
 
+        if p == "/api/fish/growth_curve":
+            return self._json(fish_growth_curve(cage_id=(one("cage_id", "") or None)))
+
         if p == "/api/heatmap":
             g = heat_grid()
             return self._json({"grid": g, "resolution": "10x10",
                                "offline": g is None})
 
         if p == "/api/fish/positions3d":
-            d = fish_positions_3d()
+            d = fish_positions_3d(cage_id=(one("cage_id", "") or None))
             return self._json({"data": d, "offline": d is None})
 
         if p == "/api/fish/cameras":
