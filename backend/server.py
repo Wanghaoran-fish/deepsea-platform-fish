@@ -562,9 +562,15 @@ def fish_growth_curve(cage_id=None):
     n = max(2, int((end - t0) / day) + 1)
     n = min(n, 400)  # 安全上限，防止配置异常导致几千点
     points = []
+    span = t1 - t0
     for i in range(n):
         ts = t0 + i * day
-        points.append({"ts": ts, "planned_weight_g": round(planned_weight(cage, ts) or w0, 1)})
+        # 🔴 2026-10-29 王浩然：真实鱼类生长不是匀速直线 —— 幼鱼期长得快、
+        # 临近起捕逐渐放缓（von Bertalanffy 型渐近曲线）。
+        # 用幂次 u^p 变形：u∈[0,1]，p=2.3 → 前期陡、尾部平，且端点仍严格卡在 w0/w1。
+        u = max(0.0, min(1.0, (ts - t0) / span))
+        w = w0 + (w1 - w0) * (1.0 - (1.0 - u) ** 2.3)
+        points.append({"ts": ts, "planned_weight_g": round(w, 1)})
     # 当前实测点：取最近 5 秒的高频序列最后一条；离线则给 None（不编）
     sim = fish_sim_state()
     offline = sim["gen_status"] == "stopped" or sim["sim_mode"] == "camera_off"
